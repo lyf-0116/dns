@@ -13,6 +13,9 @@ var (
 	xfrA        = testRR(`x.miek.nl.	1792	IN	A	10.0.0.1`)
 	xfrMX       = testRR(`miek.nl.	1800	IN	MX	1	x.miek.nl.`)
 	xfrTestData = []RR{xfrSoa, xfrA, xfrMX, xfrSoa}
+
+	xfrDecoySerialSoa = testRR(`miek.nl.	0	IN	SOA	linode.atoom.net. miek.miek.nl. 2009032803 21600 7200 604800 3600`)
+	xfrDecoyZoneSoa   = testRR(`other.	0	IN	SOA	linode.atoom.net. miek.miek.nl. 2009032802 21600 7200 604800 3600`)
 )
 
 func InvalidXfrServer(w ResponseWriter, req *Msg) {
@@ -42,6 +45,19 @@ func MultipleEnvelopeXfrServer(w ResponseWriter, req *Msg) {
 	go tr.Out(w, req, ch)
 
 	for _, rr := range xfrTestData {
+		ch <- &Envelope{RR: []RR{rr}}
+	}
+	close(ch)
+	w.Hijack()
+}
+
+func SOADecoyEnvelopeXfrServer(w ResponseWriter, req *Msg) {
+	ch := make(chan *Envelope)
+	tr := new(Transfer)
+
+	go tr.Out(w, req, ch)
+
+	for _, rr := range []RR{xfrSoa, xfrA, xfrDecoySerialSoa, xfrMX, xfrDecoyZoneSoa, xfrSoa} {
 		ch <- &Envelope{RR: []RR{rr}}
 	}
 	close(ch)
@@ -123,6 +139,80 @@ func TestMultiEnvelopeXfr(t *testing.T) {
 	defer s.Shutdown()
 
 	axfrTestingSuite(t, addrstr)
+}
+
+func TestMultiEnvelopeXfrWithSOADecoys(t *testing.T) {
+	HandleFunc("miek.nl.", SOADecoyEnvelopeXfrServer)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, _, err := RunLocalTCPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %s", err)
+	}
+	defer s.Shutdown()
+
+	tr := new(Transfer)
+	m := new(Msg)
+	m.SetAxfr("miek.nl.")
+
+	c, err := tr.In(m, addrstr)
+	if err != nil {
+		t.Fatal("failed to zone transfer in", err)
+	}
+
+	expected := []RR{xfrSoa, xfrA, xfrDecoySerialSoa, xfrMX, xfrDecoyZoneSoa, xfrSoa}
+	var records []RR
+	for msg := range c {
+		if msg.Error != nil {
+			t.Fatal(msg.Error)
+		}
+		records = append(records, msg.RR...)
+	}
+	if len(records) != len(expected) {
+		t.Fatalf("bad axfr: expected %v, got %v", expected, records)
+	}
+	for i, rr := range records {
+		if !IsDuplicate(rr, expected[i]) {
+			t.Fatalf("bad axfr: expected %v, got %v", expected, records)
+		}
+	}
+}
+
+func TestMultiEnvelopeIxfrFallbackWithSOADecoys(t *testing.T) {
+	HandleFunc("miek.nl.", SOADecoyEnvelopeXfrServer)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, _, err := RunLocalTCPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %s", err)
+	}
+	defer s.Shutdown()
+
+	tr := new(Transfer)
+	m := new(Msg)
+	m.SetIxfr("miek.nl.", 1, ".", ".")
+
+	c, err := tr.In(m, addrstr)
+	if err != nil {
+		t.Fatal("failed to zone transfer in", err)
+	}
+
+	expected := []RR{xfrSoa, xfrA, xfrDecoySerialSoa, xfrMX, xfrDecoyZoneSoa, xfrSoa}
+	var records []RR
+	for msg := range c {
+		if msg.Error != nil {
+			t.Fatal(msg.Error)
+		}
+		records = append(records, msg.RR...)
+	}
+	if len(records) != len(expected) {
+		t.Fatalf("bad ixfr: expected %v, got %v", expected, records)
+	}
+	for i, rr := range records {
+		if !IsDuplicate(rr, expected[i]) {
+			t.Fatalf("bad ixfr: expected %v, got %v", expected, records)
+		}
+	}
 }
 
 func axfrTestingSuite(t *testing.T, addrstr string) {

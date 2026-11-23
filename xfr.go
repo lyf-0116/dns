@@ -86,6 +86,9 @@ func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
 
 func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 	first := true
+	var zoneName string
+	var zoneSerial uint32
+	var zoneClass uint16
 	defer func() {
 		// First close the connection, then the channel. This allows functions blocked on
 		// the channel to assume that the connection is closed and no further operations are
@@ -117,6 +120,8 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 				c <- &Envelope{in.Answer, ErrSoa}
 				return
 			}
+			soa := in.Answer[0].(*SOA)
+			zoneName, zoneSerial, zoneClass = soa.Hdr.Name, soa.Serial, soa.Hdr.Class
 			first = !first
 			// only one answer that is SOA, receive more
 			if len(in.Answer) == 1 {
@@ -128,7 +133,7 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 
 		if !first {
 			t.tsigTimersOnly = true // Subsequent envelopes use this.
-			if isSOALast(in) {
+			if isSOALastForZone(in, zoneName, zoneSerial, zoneClass) {
 				c <- &Envelope{in.Answer, nil}
 				return
 			}
@@ -139,8 +144,11 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 
 func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 	var serial uint32 // The first serial seen is the current server serial
+	var zoneName string
+	var zoneClass uint16
 	axfr := true
 	n := 0
+	rrCount := 0
 	qser := q.Ns[0].(*SOA).Serial
 	defer func() {
 		// First close the connection, then the channel. This allows functions blocked on
@@ -175,7 +183,8 @@ func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 				return
 			}
 			// This serial is important
-			serial = in.Answer[0].(*SOA).Serial
+			soa := in.Answer[0].(*SOA)
+			zoneName, serial, zoneClass = soa.Hdr.Name, soa.Serial, soa.Hdr.Class
 			// Check if there are no changes in zone
 			if qser >= serial {
 				c <- &Envelope{in.Answer, nil}
@@ -185,19 +194,32 @@ func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 		// Now we need to check each message for SOA records, to see what we need to do
 		t.tsigTimersOnly = true
 		for _, rr := range in.Answer {
-			if v, ok := rr.(*SOA); ok {
-				if v.Serial == serial {
-					n++
-					// quit if it's a full axfr or the servers' SOA is repeated the third time
-					if axfr && n == 2 || n == 3 {
-						c <- &Envelope{in.Answer, nil}
-						return
-					}
-				} else if axfr {
-					// it's an ixfr
+			rrCount++
+			if rrCount == 1 {
+				n = 1
+				continue
+			}
+			if rrCount == 2 {
+				// If the second RR is an SOA with a different serial, the server
+				// returned deltas instead of a full zone. Otherwise this is a full
+				// zone transfer (IXFR falling back to AXFR), even if later records
+				// contain SOAs from other zones.
+				if v, ok := rr.(*SOA); ok && isSOAForZone(v, zoneName, zoneClass) && v.Serial != serial {
 					axfr = false
 				}
 			}
+			v, ok := rr.(*SOA)
+			if !ok || !isSOAForZone(v, zoneName, zoneClass) || v.Serial != serial {
+				continue
+			}
+			n++
+		}
+		// The transfer ends when the opening SOA is seen again. For a full zone
+		// transfer that is the second occurrence; an incremental transfer repeats
+		// the serial once at the end of the last delta, so it takes a third one.
+		if (axfr && n >= 2 || n >= 3) && isSOALastForZone(in, zoneName, serial, zoneClass) {
+			c <- &Envelope{in.Answer, nil}
+			return
 		}
 		c <- &Envelope{in.Answer, nil}
 	}
@@ -285,6 +307,19 @@ func isSOAFirst(in *Msg) bool {
 func isSOALast(in *Msg) bool {
 	return len(in.Answer) > 0 &&
 		in.Answer[len(in.Answer)-1].Header().Rrtype == TypeSOA
+}
+
+func isSOAForZone(rr RR, zoneName string, zoneClass uint16) bool {
+	soa, ok := rr.(*SOA)
+	return ok && equal(soa.Hdr.Name, zoneName) && soa.Hdr.Class == zoneClass
+}
+
+func isSOALastForZone(in *Msg, zoneName string, zoneSerial uint32, zoneClass uint16) bool {
+	if len(in.Answer) == 0 {
+		return false
+	}
+	soa, ok := in.Answer[len(in.Answer)-1].(*SOA)
+	return ok && isSOAForZone(soa, zoneName, zoneClass) && soa.Serial == zoneSerial
 }
 
 const errXFR = "bad xfr rcode: %d"
