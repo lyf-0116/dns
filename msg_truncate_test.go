@@ -73,6 +73,29 @@ func TestRequestTruncateExtraEdns0(t *testing.T) {
 	}
 }
 
+func TestRequestTruncateLargeEdns0(t *testing.T) {
+	const size = MinMsgSize
+
+	m := new(Msg)
+	m.SetQuestion("large.example.com.", TypeSRV)
+	m.SetEdns0(size, true)
+
+	reply := new(Msg)
+	reply.SetReply(m)
+	reply.SetEdns0(size, true)
+	reply.IsEdns0().Option = append(reply.IsEdns0().Option, &EDNS0_PADDING{
+		Padding: make([]byte, 600),
+	})
+
+	reply.Truncate(size)
+	if got := reply.Len(); got > size {
+		t.Errorf("message length should be below %d bytes, got %d bytes", size, got)
+	}
+	if !reply.Truncated {
+		t.Errorf("truncated bit should be set")
+	}
+}
+
 func TestRequestTruncateExtraRegression(t *testing.T) {
 	const size = 2048
 

@@ -93,6 +93,12 @@ func (dns *Msg) Truncate(size int) {
 	if edns0 != nil {
 		// Add the OPT record back onto the additional section.
 		dns.Extra = append(dns.Extra, edns0)
+		if dns.Len() > size {
+			// The OPT record does not fit in the remaining space.
+			// Drop it and force a retry over TCP.
+			dns.Extra = dns.Extra[:len(dns.Extra)-1]
+			dns.Truncated = true
+		}
 	}
 }
 
