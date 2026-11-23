@@ -393,6 +393,11 @@ func (rr *RRSIG) Verify(k *DNSKEY, rrset []RR) error {
 
 		return ErrRRset
 	}
+	if rr.TypeCovered == TypeNSEC || rr.TypeCovered == TypeNSEC3 {
+		if err := verifyDenialRRsetSemantics(rr.TypeCovered, rrset, signerName); err != nil {
+			return err
+		}
+	}
 
 	// RFC 4035 5.3.2.  Reconstructing the Signed Data
 	// Copy the sig, except the rrsig data
