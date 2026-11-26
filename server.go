@@ -672,12 +672,39 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 		if t := req.IsTsig(); t != nil {
 			w.tsigStatus = TsigVerifyWithProvider(m, w.tsigProvider, "", false)
 			w.tsigTimersOnly = false
-			w.tsigRequestMAC = t.MAC
+			if w.tsigStatus == nil {
+				// The request MAC is only trusted once the request has
+				// verified; an unverified MAC must not seed response signing.
+				w.tsigRequestMAC = t.MAC
+			} else {
+				w.tsigRequestMAC = ""
+			}
 		}
 	}
 
 	if w.udp != nil && cap(m) == srv.UDPSize {
 		srv.udpPool.Put(m[:srv.UDPSize])
+	}
+
+	if t := req.IsTsig(); t != nil && w.tsigStatus != nil {
+		// A present but invalid TSIG is never passed to the handler. Reply
+		// with RCODE NOTAUTH and a TSIG RR carrying the matching Error code
+		// (RFC 8945 Section 5.3): an unrecognized key is BADKEY, while any
+		// other verification failure, notably a MAC mismatch, is BADSIG.
+		// Per RFC 8945 Section 5.3.2 both error responses are unsigned;
+		// TsigGenerateWithProvider leaves the MAC empty for those codes.
+		// A request without a TSIG record is unaffected and still reaches
+		// the handler.
+		tsigError := uint16(RcodeBadSig)
+		if errors.Is(w.tsigStatus, ErrSecret) {
+			tsigError = RcodeBadKey
+		}
+		reply := new(Msg)
+		reply.SetRcode(req, RcodeNotAuth)
+		reply.SetTsig(t.Hdr.Name, t.Algorithm, t.Fudge, time.Now().Unix())
+		reply.IsTsig().Error = tsigError
+		_ = w.WriteMsg(reply)
+		return
 	}
 
 	srv.Handler.ServeDNS(w, req) // Writes back to the client
