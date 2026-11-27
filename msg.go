@@ -61,6 +61,7 @@ var (
 	ErrLongDomain    error = &Error{err: fmt.Sprintf("domain name exceeded %d wire-format octets", maxDomainNameWireOctets)}
 	ErrNoSig         error = &Error{err: "no signature found"}
 	ErrPrivKey       error = &Error{err: "bad private key"}
+	ErrQuestion      error = &Error{err: "question section mismatch"} // ErrQuestion indicates there is a mismatch with the message's question section.
 	ErrRcode         error = &Error{err: "bad rcode"}
 	ErrRdata         error = &Error{err: "bad rdata"}
 	ErrRRset         error = &Error{err: "bad rrset"}
@@ -962,6 +963,35 @@ func (dns *Msg) isCompressible() bool {
 	// If we only have one question, there is nothing we can ever compress.
 	return len(dns.Question) > 1 || len(dns.Answer) > 0 ||
 		len(dns.Ns) > 0 || len(dns.Extra) > 0
+}
+
+// matchQuestion reports whether the question section of dns is equivalent to
+// the one in the query that was sent out, as required by RFC 5452. The query
+// name is compared case-insensitively and independent of the on-wire encoding:
+// a trailing dot or a compression pointer both resolve to the same fully
+// qualified name once the message has been unpacked. EDNS(0) OPT records live
+// in the additional section, so differences there are not considered here.
+//
+// RFC 1035 allows a name server to return a minimal error reply (a non-zero
+// RCODE) with an empty question section. Such a reply carries no records that
+// could be cached, so it is accepted on the strength of the message ID rather
+// than being mistaken for a forgery.
+func (dns *Msg) matchQuestion(query *Msg) bool {
+	if len(dns.Question) == 0 && dns.Rcode != RcodeSuccess {
+		return true
+	}
+	if len(dns.Question) != len(query.Question) {
+		return false
+	}
+	for i, q := range query.Question {
+		got := dns.Question[i]
+		if CanonicalName(got.Name) != CanonicalName(q.Name) ||
+			got.Qtype != q.Qtype ||
+			got.Qclass != q.Qclass {
+			return false
+		}
+	}
+	return true
 }
 
 // Len returns the message length when in (un)compressed wire format.

@@ -230,9 +230,12 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 	if isPacketConn(co.Conn) {
 		for {
 			r, err = co.ReadMsg()
-			// Ignore replies with mismatched IDs because they might be
-			// responses to earlier queries that timed out.
-			if err != nil || r.Id == m.Id {
+			// Ignore replies that do not match the outstanding query, since
+			// they might be forged or responses to earlier queries that timed
+			// out. Besides the message ID, the question section (name, type and
+			// class) must match; see RFC 5452. Keep waiting for the real
+			// answer instead of accepting an unrelated reply.
+			if err != nil || (r.Id == m.Id && r.matchQuestion(m)) {
 				break
 			}
 		}
@@ -240,6 +243,8 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 		r, err = co.ReadMsg()
 		if err == nil && r.Id != m.Id {
 			err = ErrId
+		} else if err == nil && !r.matchQuestion(m) {
+			err = ErrQuestion
 		}
 	}
 	rtt = time.Since(t)

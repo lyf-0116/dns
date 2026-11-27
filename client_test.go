@@ -340,6 +340,225 @@ func TestClientSyncTCPBadID(t *testing.T) {
 	}
 }
 
+// helloServerBadQuestion replies with a matching ID but a question section that
+// names a different domain, simulating a forged answer.
+func helloServerBadQuestion(w ResponseWriter, req *Msg) {
+	m := new(Msg)
+	m.SetReply(req)
+	m.Question[0].Name = "example.org."
+
+	m.Extra = make([]RR, 1)
+	m.Extra[0] = &TXT{Hdr: RR_Header{Name: m.Question[0].Name, Rrtype: TypeTXT, Class: ClassINET, Ttl: 0}, Txt: []string{"Forged answer"}}
+	w.WriteMsg(m)
+}
+
+// helloServerBadThenGoodQuestion first sends a forged reply (matching ID, wrong
+// question section) followed by the legitimate reply.
+func helloServerBadThenGoodQuestion(w ResponseWriter, req *Msg) {
+	forged := new(Msg)
+	forged.SetReply(req)
+	forged.Question[0].Name = "example.org."
+	forged.Extra = make([]RR, 1)
+	forged.Extra[0] = &TXT{Hdr: RR_Header{Name: forged.Question[0].Name, Rrtype: TypeTXT, Class: ClassINET, Ttl: 0}, Txt: []string{"Forged answer"}}
+	w.WriteMsg(forged)
+
+	good := new(Msg)
+	good.SetReply(req)
+	good.Extra = make([]RR, 1)
+	good.Extra[0] = &TXT{Hdr: RR_Header{Name: good.Question[0].Name, Rrtype: TypeTXT, Class: ClassINET, Ttl: 0}, Txt: []string{"Hello world"}}
+	w.WriteMsg(good)
+}
+
+func TestClientSyncBadQuestion(t *testing.T) {
+	HandleFunc("miek.nl.", helloServerBadQuestion)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, _, err := RunLocalUDPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeSOA)
+
+	// Over UDP a mismatched question section must be treated as a forgery: the
+	// client keeps waiting rather than accepting the unrelated reply, so the
+	// exchange eventually times out.
+	c := &Client{
+		Timeout: 10 * time.Millisecond,
+	}
+	if _, _, err := c.Exchange(m, addrstr); err == nil || !isNetworkTimeout(err) {
+		t.Errorf("forged reply was not ignored: %v", err)
+	}
+}
+
+func TestClientSyncBadThenGoodQuestion(t *testing.T) {
+	HandleFunc("miek.nl.", helloServerBadThenGoodQuestion)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, _, err := RunLocalUDPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeSOA)
+
+	c := new(Client)
+	r, _, err := c.Exchange(m, addrstr)
+	if err != nil {
+		t.Fatalf("failed to exchange after discarding forged reply: %v", err)
+	}
+	if r.Question[0].Name != m.Question[0].Name {
+		t.Errorf("accepted reply with wrong question name %q", r.Question[0].Name)
+	}
+}
+
+func TestClientSyncTCPBadQuestion(t *testing.T) {
+	HandleFunc("miek.nl.", helloServerBadQuestion)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, _, err := RunLocalTCPServer(":0")
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeSOA)
+
+	c := &Client{Net: "tcp"}
+	if _, _, err := c.Exchange(m, addrstr); err != ErrQuestion {
+		t.Errorf("expected ErrQuestion, got %v", err)
+	}
+}
+
+// A reply that compresses the question name or omits the EDNS(0) OPT record is
+// still equivalent to the query and must be accepted.
+func TestClientSyncEquivalentQuestion(t *testing.T) {
+	t.Run("compressed question name", func(t *testing.T) {
+		HandleFunc("miek.nl.", HelloServerCompress)
+		defer HandleRemove("miek.nl.")
+
+		s, addrstr, _, err := RunLocalUDPServer(":0")
+		if err != nil {
+			t.Fatalf("unable to run test server: %v", err)
+		}
+		defer s.Shutdown()
+
+		m := new(Msg)
+		m.SetQuestion("MIEK.NL.", TypeSOA)
+
+		c := new(Client)
+		r, _, err := c.Exchange(m, addrstr)
+		if err != nil {
+			t.Fatalf("compressed reply rejected: %v", err)
+		}
+		if CanonicalName(r.Question[0].Name) != CanonicalName(m.Question[0].Name) {
+			t.Errorf("question name %q does not match %q", r.Question[0].Name, m.Question[0].Name)
+		}
+	})
+
+	t.Run("edns option omitted by server", func(t *testing.T) {
+		HandleFunc("miek.nl.", HelloServer)
+		defer HandleRemove("miek.nl.")
+
+		s, addrstr, _, err := RunLocalUDPServer(":0")
+		if err != nil {
+			t.Fatalf("unable to run test server: %v", err)
+		}
+		defer s.Shutdown()
+
+		m := new(Msg)
+		m.SetQuestion("miek.nl.", TypeTXT)
+		m.SetEdns0(2048, true)
+
+		c := new(Client)
+		if _, _, err := c.Exchange(m, addrstr); err != nil {
+			t.Fatalf("reply without EDNS(0) OPT rejected: %v", err)
+		}
+	})
+}
+
+func TestMatchQuestion(t *testing.T) {
+	query := new(Msg)
+	query.SetQuestion("miek.nl.", TypeSOA)
+
+	tests := []struct {
+		name     string
+		question []Question
+		want     bool
+	}{
+		{
+			name:     "identical",
+			question: []Question{{Name: "miek.nl.", Qtype: TypeSOA, Qclass: ClassINET}},
+			want:     true,
+		},
+		{
+			name:     "case-insensitive name",
+			question: []Question{{Name: "MiEk.NL.", Qtype: TypeSOA, Qclass: ClassINET}},
+			want:     true,
+		},
+		{
+			name:     "missing trailing dot",
+			question: []Question{{Name: "miek.nl", Qtype: TypeSOA, Qclass: ClassINET}},
+			want:     true,
+		},
+		{
+			name:     "different name",
+			question: []Question{{Name: "example.org.", Qtype: TypeSOA, Qclass: ClassINET}},
+			want:     false,
+		},
+		{
+			name:     "different qtype",
+			question: []Question{{Name: "miek.nl.", Qtype: TypeA, Qclass: ClassINET}},
+			want:     false,
+		},
+		{
+			name:     "different qclass",
+			question: []Question{{Name: "miek.nl.", Qtype: TypeSOA, Qclass: ClassCHAOS}},
+			want:     false,
+		},
+		{
+			name:     "empty question section with error rcode",
+			question: nil,
+			want:     true,
+		},
+		{
+			name: "extra question",
+			question: []Question{
+				{Name: "miek.nl.", Qtype: TypeSOA, Qclass: ClassINET},
+				{Name: "example.org.", Qtype: TypeSOA, Qclass: ClassINET},
+			},
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reply := new(Msg)
+			reply.Question = test.question
+			if test.question == nil {
+				// Minimal error replies are allowed to omit the question section.
+				reply.Rcode = RcodeNotImplemented
+			}
+			if got := reply.matchQuestion(query); got != test.want {
+				t.Errorf("matchQuestion = %v, want %v", got, test.want)
+			}
+		})
+	}
+
+	t.Run("empty question section with success rcode", func(t *testing.T) {
+		reply := new(Msg)
+		reply.Rcode = RcodeSuccess
+		if reply.matchQuestion(query) {
+			t.Error("successful reply without a question section must not match")
+		}
+	})
+}
+
 func TestClientEDNS0(t *testing.T) {
 	HandleFunc("miek.nl.", HelloServer)
 	defer HandleRemove("miek.nl.")
